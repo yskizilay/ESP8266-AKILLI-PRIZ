@@ -1,103 +1,201 @@
 #include <ESP8266WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
 #include <ArduinoJson.h>
-#include <WiFiUdp.h>
-#include <ESP8266WebServer.h>
-#include <ESP8266mDNS.h>
-#include <ESP8266HTTPUpdateServer.h>
+#include <time.h>
+#include "secrets_smartsocket.h"  
 
-const char* ssid = "KIZILAY_HOME";
-const char* password = "Kizilay_Home_58_Engineers";
+unsigned long lastMillis = 0;
+unsigned long previousMillis = 0;
+const long interval = 5000;
+ 
+#define AWS_IOT_PUBLISH_TOPIC   "esp8266/pub"
+#define AWS_IOT_SUBSCRIBE_TOPIC "esp8266/sub"
 
-WiFiUDP Udp;
-ESP8266WebServer httpServer(80);
-ESP8266HTTPUpdateServer httpUpdater;
-const char* host = "220vControl";
+String TIMESTAMP = " ";
 
-unsigned int localUdpPort = 5000;  // local port to listen on
-char incomingPacket[255];  // buffer for incoming packets
-char  replyPacekt[] = "Succes";  // a reply string to send back
-int light = 2;
-int socket = 16;
-void setup()
+time_t now;
+time_t nowish = 1510592825;
+
+#define DEBUG true
+int ROLE_PIN = 16;
+
+int wifi_error_blink_count = 2;
+int aws_error_blink_count = 5;
+String ROLE_STATUS = " ";
+
+ 
+WiFiClientSecure net;
+ 
+BearSSL::X509List cert(cacert);
+BearSSL::X509List client_crt(client_cert);
+BearSSL::PrivateKey key(privkey);
+ 
+PubSubClient client(net);
+ 
+
+ 
+ 
+void NTPConnect(void)
 {
-  Serial.begin(115200);
-  Serial.println();
-  pinMode(socket, OUTPUT);
-  pinMode(light, OUTPUT);
-
-  Serial.printf("Connecting to %s ", ssid);
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED)
+  if(DEBUG){Serial.print("Setting time using SNTP"); }
+  configTime(TIME_ZONE * 3600, 0 * 3600, "pool.ntp.org", "time.nist.gov");
+  now = time(nullptr);
+  while (now < nowish)
   {
     delay(500);
-    Serial.print(".");
+    if(DEBUG){Serial.print(".");}
+    now = time(nullptr);
   }
-  Serial.println(" connected");
-
-  Udp.begin(localUdpPort);
-  Serial.printf("Now listening at IP %s, UDP port %d\n", WiFi.localIP().toString().c_str(), localUdpPort);
-
-  MDNS.begin(host);
-
-  httpUpdater.setup(&httpServer);
-  httpServer.begin();
-
-  MDNS.addService("http", "tcp", 80);
-  Serial.printf("HTTPUpdateServer ready! Open http://%s.local/update in your browser\n", host);
-
-  digitalWrite(socket, HIGH);
-  delay(500);
-  digitalWrite(socket,LOW);
-  delay(100);
-    digitalWrite(socket, HIGH);
-  delay(500);
-  digitalWrite(socket,LOW);
-  delay(100);
-  digitalWrite(light, HIGH);
+  if(DEBUG){Serial.println("done!");}
+  struct tm timeinfo;
+  gmtime_r(&now, &timeinfo);
+  if(DEBUG){
+  Serial.print("Current time: ");
+  Serial.print(asctime(&timeinfo));
+  }
+  TIMESTAMP = asctime(&timeinfo);
 }
+ 
+ 
+void messageReceived(char *topic, byte *payload, unsigned int length)
+{
+  if(DEBUG){
+  Serial.print("Received [");
+  Serial.print(topic);
+  Serial.print("]: "); }
+  String incoming_packet;
+  for (int i = 0; i < length; i++)
+  {
+    if(DEBUG){Serial.print((char)payload[i]);}
+    incoming_packet +=(char)payload[i];
+  }
+  StaticJsonDocument<200> r_json;
+  deserializeJson(r_json,incoming_packet);
+  ROLE_STATUS = r_json["role_status"].as<String>();
+  if(ROLE_STATUS == "HIGH" ){
+    digitalWrite(16, HIGH);
+    digitalWrite(LED_BUILTIN, LOW);
+    }
+  if(ROLE_STATUS == "LOW" ){
+    digitalWrite(16, LOW);
+    digitalWrite(LED_BUILTIN, HIGH);
+    }
+    publishMessage("after_received");  
+}
+ 
+ 
+void connectAWS()
+{
+  delay(1000);
+  WiFi.mode(WIFI_STA);
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    for (byte x = 0; x < (sizeof(WIFI_SSID) / sizeof(WIFI_SSID[0])); x++){
+      if(DEBUG){Serial.println(String("Attempting to connect to SSID: ") + String(WIFI_SSID[x]) +" " +String(WIFI_PASSWORD[x]));}
+         delay(200);
+        WiFi.begin(WIFI_SSID[x], WIFI_PASSWORD[x]);
+        delay(5000);
+        if(WiFi.status() == WL_CONNECTED){
+          break;
+          }
+    }
+    if(WiFi.status() == WL_CONNECTED){
+          break;
+          }
+    if(DEBUG){Serial.println(".");}
+    delay(1000);
+    for(int i =1 ; i<=wifi_error_blink_count; i++){
+      digitalWrite(LED_BUILTIN, LOW);
+      delay(100);
+      digitalWrite(LED_BUILTIN, HIGH);
+      delay(100);
+      }
+    
+    
+  }
+  if(DEBUG){Serial.println(String("Connected to SSID: ") + String(WiFi.SSID()));}
+  
+ 
+  NTPConnect();
+ 
+  net.setTrustAnchors(&cert);
+  net.setClientRSACert(&client_crt, &key);
+ 
+  client.setServer(MQTT_HOST, 8883);
+  client.setCallback(messageReceived);
+ 
+ 
+  if(DEBUG){Serial.println("Connecting to AWS IOT");}
+ 
+  while (!client.connect(THINGNAME))
+  {
+    if(DEBUG){Serial.print(".");}
+    for(int i =1 ; i<=aws_error_blink_count; i++){
+      digitalWrite(LED_BUILTIN, LOW);
+      delay(100);
+      digitalWrite(LED_BUILTIN, HIGH);
+      delay(100);
+      }
+  }
+ 
+  if (!client.connected()) {
+    if(DEBUG){Serial.println("AWS IoT Timeout!");}
+    return;
+  }
+  // Subscribe to a topic
+  client.subscribe(AWS_IOT_SUBSCRIBE_TOPIC);
+ 
+  if(DEBUG){Serial.println("AWS IoT Connected!");}
+}
+ 
+ 
+void publishMessage(String connection_type)
+{
+  digitalWrite(LED_BUILTIN, LOW);
+  NTPConnect();
+  StaticJsonDocument<200> doc;
+  doc["time"] = TIMESTAMP;
+  doc["pub_reason"] = connection_type;
+  doc["thingname"] = THINGNAME;
+  doc["current_pin_status"] = digitalRead(16);
+  char jsonBuffer[512];
+  serializeJson(doc, jsonBuffer); // print to client
+  client.publish(AWS_IOT_PUBLISH_TOPIC, jsonBuffer);
+  delay(100);
+  digitalWrite(LED_BUILTIN, HIGH);
 
+}
+ 
+ 
+void setup()
+{
+  pinMode(LED_BUILTIN, OUTPUT);
+  Serial.begin(115200);
+  connectAWS();
+ pinMode(16,OUTPUT);
+ publishMessage("on_setupLoop");
+ 
+}
+ 
+ 
 void loop()
 {
-  httpServer.handleClient();
-  int packetSize = Udp.parsePacket();
-  if (packetSize)
-  {
-    // receive incoming UDP packets
-    Serial.printf("Received %d bytes from %s, port %d\n", packetSize, Udp.remoteIP().toString().c_str(), Udp.remotePort());
-    int len = Udp.read(incomingPacket, 255);
-    
-    if (len > 0)
-    {
-      incomingPacket[len] = 0;
-    }
-    Serial.printf("UDP packet contents: %s\n", incomingPacket);
-    String incommingstringmessage(incomingPacket);
-    StaticJsonBuffer<250> jsonBuffer;
-    JsonObject& root = jsonBuffer.parseObject(incommingstringmessage);
-    String socketstatus = root["socketstatus"];
-    
-
-    if(incomingPacket[0] == '1'){
-    digitalWrite(socket, HIGH);
-    digitalWrite(light, LOW);
-    delay(100);
-    digitalWrite(light,HIGH);
-    Serial.println("Socket_turned_on");
-    }
-  else if(incomingPacket[0] == '0'){
-    digitalWrite(socket, LOW);
-   
-        Serial.println("Socket_turned_off");
-    }
-  else {
-    digitalWrite(socket, LOW);
-        Serial.println("Else_Socket_turned_off");
-    }
  
-    // send back a reply, to the IP address and port we got the packet from
-    //Udp.beginPacket(Udp.remoteIP(), Udp.remotePort());
-    //Udp.write(replyPacekt);
-    //Udp.endPacket();
+  now = time(nullptr);
+ 
+  if (!client.connected())
+  {
+    connectAWS();
+    publishMessage("reconnected_aws");
+  }
+  else
+  {
+    client.loop();
+    if (millis() - lastMillis > 360000)
+    {
+      lastMillis = millis();
+      publishMessage("heartbit");
+    }
   }
 }
